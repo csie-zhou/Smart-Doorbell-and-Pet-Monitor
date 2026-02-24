@@ -44,4 +44,10 @@ Call the `.value()` method on your sensor Pin object. It returns `0` (no motion)
 **Challenges 5 & 6 - LED Control:**
 Use `.value(1)` to turn on and `.value(0)` to turn off. Or use the shortcuts `.on()` and `.off()`.
 
+## What To Learn
+
+- **I2C addressing:** The OLED has a fixed address (`0x3C`). Multiple I2C devices share SDA/SCL.
+- **Digital I/O basics:** Reading input (sensor) vs writing output (LED).
+- **Event-driven logic:** The system only responds when motion is detected.
+
 <img width="755" height="896" alt="image" src="https://github.com/user-attachments/assets/0def7832-5cc6-4e6d-bef5-14c56e0373c5" />
