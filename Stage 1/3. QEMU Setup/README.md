@@ -191,6 +191,11 @@ Now we can connect with just:
 ssh qemu-rpi
 ```
 
+If fail with porting, try this in Pi terminal before ssh:
+```
+sudo dhclient -r usb0 && sudo dhclient usb0
+```
+
 ### Step 11: Install Kernel Headers
 
 #### Update Package Lists
