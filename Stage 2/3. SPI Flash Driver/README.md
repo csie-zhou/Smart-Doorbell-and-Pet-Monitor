@@ -346,6 +346,15 @@ echo 'New Data!!' | sudo dd of=/dev/spiflash0 bs=1 count=10
 sudo dd if=/dev/spiflash0 bs=1 count=10 2>/dev/null
 # New Data!!
 ```
+- `sudo dd of=/dev/spiflash0 bs=1 count=12`:
+  - `dd`: low-level copy
+  - `of`: output file, writes to `/dev/spiflash0` instead of stdout
+  - `bs=1`: block size, write 1 byte at a time
+  - `count=12`, write 12 blocks, `bs=1 * 12` in total
+  - Why not `bs=12`? Safer for testing, write 1 byte at a time, shows which byte fails
+- `sudo dd if=/dev/spiflash0 bs=1 count=12 2>/dev/null`
+  - `if`: input file
+  - `2>/dev/null`: dd always print stderr (fd=2) stats, if only want to show data, redirect the stats to `/dev/null` (discard)
 
 ---
 
