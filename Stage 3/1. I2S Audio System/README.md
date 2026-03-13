@@ -361,7 +361,31 @@ MODULE_AUTHOR("Danny");
 MODULE_DESCRIPTION("Simple ALSA Test Driver for QEMU");
 MODULE_VERSION("1.0");
 ```
-
+##### audio_test_probe
+- `audio_test_probe(struct platform_device *pdev)`: `probe()` is automatically called by the kernel, as a setup function
+  - `*pdev`: virtual device address
+- `snd_card`: top-level ALSA object, handles everything
+```
+snd_card
+    ↓
+    └── snd_pcm (audio stream)
+            ↓
+            ├── playback substream
+            └── capture substream
+```
+- Three different name fields ALSA uses in different places:
+```
+driver    → internal identifier    → /proc/asound/cards
+shortname → brief display name     → aplay -l shows this
+longname  → full description       → cat /proc/asound/cards shows this
+```
+- `snd_pcm_new(card, "Test PCM", 0, 1, 1, &pcm)`:
+  - 0: device index (device 0 within the card)
+  - 1: number of playback substreams
+  - 1: number of capture substreams
+- `platform_set_drvdata(pdev, card)`: Stores the card pointer (`probe()`) inside the platform device for later retrieval (`remove()`). 
+  
+ 
 ### Makefile
 ```makefile
 obj-m += audio_test.o
