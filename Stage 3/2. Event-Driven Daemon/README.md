@@ -814,8 +814,7 @@ sudo chmod 666 /dev/motion0 /dev/spiflash0
 
 ## Step 10: Test
 
-### Test the Daemon
-Create a virtual video device:
+### Create a virtual video device
 ```
 # Load v4l2loopback used in Stage 2
 sudo modprobe v4l2loopback devices=1 video_nr=10
@@ -835,7 +834,7 @@ daemon reads from /dev/video10
 video_thread actually captures real frames!
 bytes_captured grows with real data
 ```
-Test:
+### Test the Daemon
 ```
 # Verify all devices exist
 ls -l /dev/motion0 /dev/spiflash0
