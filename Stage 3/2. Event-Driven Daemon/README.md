@@ -800,8 +800,6 @@ module_init(motion_char_init);
 module_exit(motion_char_exit);
 ```
 
-1. 
-
 ### Recompile
 ```
 cd ~/kernel-modules/motion_char
