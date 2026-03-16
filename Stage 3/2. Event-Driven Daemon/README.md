@@ -1,4 +1,4 @@
-# 3. Event-Driven Daemon
+# 2. Event-Driven Daemon
 ### Building doorbellod — epoll-Based Userspace Application
 
 ## Goals
@@ -98,6 +98,9 @@ struct doorbell_daemon {
     time_t recording_start;
     size_t bytes_captured;
     int    clip_number;
+
+	/* Flash write position */
+	size_t flash_write_offset;
 
     /* Worker threads */
     pthread_t video_thread;
@@ -302,46 +305,109 @@ static void handle_motion_event(struct doorbell_daemon *daemon)
 }
 
 /* Handle saving complete */
-// Saves clips to flash
 static void handle_save_complete(struct doorbell_daemon *daemon)
 {
-    char     filename[128];
-    ssize_t  written;
+    char    	 filename[128];
+    ssize_t 	 written;
     unsigned int erase_addr = 0;
+    size_t 	 sectors_needed;
+    size_t	 i;
 
+    /* Generate filename */
     snprintf(filename, sizeof(filename), "clip_%d_%ld.raw",
              daemon->clip_number, daemon->recording_start);
 
-    if (daemon->flash_fd >= 0) {
-        /* Erase sector before writing */
-        #define FLASH_IOCTL_MAGIC  'F'
-        #define FLASH_ERASE_SECTOR _IOW(FLASH_IOCTL_MAGIC, 1, unsigned int)
+    #define FLASH_IOCTL_MAGIC   'F'
+    #define FLASH_ERASE_SECTOR  _IOW(FLASH_IOCTL_MAGIC, 1, unsigned int)
+    #define SECTOR_SIZE         4096
+    #define FLASH_SIZE          (1024 * 1024)  /* 1MB */
 
-		/* Erase sector 0 before writing */
-        ioctl(daemon->flash_fd, FLASH_ERASE_SECTOR, &erase_addr);
-
-		/* Seek back to beginning of flash */
-        lseek(daemon->flash_fd, 0, SEEK_SET);
-
-        /* Only write if we have data */
-        if (daemon->bytes_captured > 0) {
-            written = write(daemon->flash_fd,
-                            daemon->video_buffer,
-                            daemon->bytes_captured);
-            if (written > 0)
-                syslog(LOG_INFO, "Saved %zd bytes to flash: %s",
-                       written, filename);
-            else
-                syslog(LOG_ERR, "Failed to write to flash: %s",
-                       strerror(errno));
-        } else {
-            syslog(LOG_INFO, "No data to save (no video device)");
-        }
-    } else {
+    /* Skip if no flash device */
+    if (daemon->flash_fd < 0) {
         syslog(LOG_WARNING, "No flash device available");
+        transition_state(daemon, STATE_IDLE);
+        return;
     }
 
-    /* Return to idle */
+    /* Skip if no data captured */
+    if (daemon->bytes_captured == 0) {
+        syslog(LOG_INFO, "No data to save (no video device)");
+        transition_state(daemon, STATE_IDLE);
+        return;
+    }
+
+    /* Check if enough space remains */
+    if (daemon->flash_write_offset + daemon->bytes_captured > FLASH_SIZE) {
+        syslog(LOG_WARNING, "Flash full! Wrapping to beginning");
+        daemon->flash_write_offset = 0;
+    }
+
+    /* Calculate sectors needed — ceiling division */
+    sectors_needed = (daemon->bytes_captured + SECTOR_SIZE - 1)
+                     / SECTOR_SIZE;
+
+    syslog(LOG_INFO, "Erasing %zu sectors at offset 0x%zx",
+           sectors_needed, daemon->flash_write_offset);
+
+    /* Erase all required sectors at current offset */
+    for (i = 0; i < sectors_needed; i++) {
+        erase_addr = daemon->flash_write_offset + (i * SECTOR_SIZE);
+
+        if (erase_addr >= FLASH_SIZE) {
+            syslog(LOG_ERR, "Erase address 0x%x exceeds flash size",
+                   erase_addr);
+            transition_state(daemon, STATE_IDLE);
+            return;
+        }
+
+        if (ioctl(daemon->flash_fd,
+                  FLASH_ERASE_SECTOR,
+                  &erase_addr) < 0) {
+            syslog(LOG_ERR, "Erase failed at 0x%x: %s",
+                   erase_addr, strerror(errno));
+            transition_state(daemon, STATE_IDLE);
+            return;
+        }
+    }
+
+    syslog(LOG_INFO, "Erase complete");
+
+    /* Seek to current write position */
+    if (lseek(daemon->flash_fd,
+              daemon->flash_write_offset,
+              SEEK_SET) < 0) {
+        syslog(LOG_ERR, "lseek failed: %s", strerror(errno));
+        transition_state(daemon, STATE_IDLE);
+        return;
+    }
+
+    /* Write clip data */
+    written = write(daemon->flash_fd,
+                    daemon->video_buffer,
+                    daemon->bytes_captured);
+
+    if (written > 0) {
+        syslog(LOG_INFO, "Saved %zd bytes to flash: %s "
+               "(offset 0x%zx)",
+               written, filename,
+               daemon->flash_write_offset);
+
+        /* Advance offset — align to sector boundary */
+        daemon->flash_write_offset += sectors_needed * SECTOR_SIZE;
+
+        syslog(LOG_INFO, "Next write offset: 0x%zx "
+               "(%zu KB used of %d KB total)",
+               daemon->flash_write_offset,
+               daemon->flash_write_offset / 1024,
+               FLASH_SIZE / 1024);
+
+    } else {
+        syslog(LOG_ERR, "Failed to write to flash: %s",
+               strerror(errno));
+        /* Don't advance offset — write failed */
+    }
+
+    /* Always return to idle */
     transition_state(daemon, STATE_IDLE);
 }
 ```
@@ -351,8 +417,12 @@ static void handle_save_complete(struct doorbell_daemon *daemon)
 
 `handle_save_complete()`:
 - No encoding, save to raw bytes from `device_read()`. Real hardware system would use .mp4 or .h264.
-- `flash_fd`: `/dev/spiflash0` file descriptor
- 
+- With `daemon->flash_write_offset`, it saves the last offset:
+	```
+ 	Save clip 1:  [clip1][0xFF 0xFF 0xFF...]
+	Save clip 2:  [clip1][clip2][0xFF 0xFF...]
+	Save clip 3:  [clip1][clip2][clip3][0xFF...]
+ 	```
 ---
 
 ## Step 6: Main Event Loop with epoll
@@ -478,6 +548,9 @@ static int daemon_init(struct doorbell_daemon *daemon)
     daemon->state       = STATE_IDLE;
     daemon->running     = 1;
     daemon->clip_number = 0;
+
+	/* Initialize flash offset */
+    daemon->flash_write_offset = 0;
 
     syslog(LOG_INFO, "Daemon initialized");
     return 0;
