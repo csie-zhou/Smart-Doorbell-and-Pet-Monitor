@@ -61,6 +61,7 @@ Start with the core data structures:
 #include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -126,13 +127,14 @@ static struct doorbell_daemon *g_daemon = NULL;
 ---
 
 ## Step 3: State Machine Implementation
+This function manages every state change in the system:
 ```c
 /* State transition handler */
 static void transition_state(struct doorbell_daemon *daemon,
                               enum doorbell_state new_state)
 {
     if (daemon->state == new_state)
-        return;
+        return;		// If no state changes, do nothing
 
     syslog(LOG_INFO, "State transition: %d -> %d",
            daemon->state, new_state);
@@ -146,10 +148,10 @@ static void transition_state(struct doorbell_daemon *daemon,
         break;
     case STATE_SAVING:
         /* Finalize flash write */
-        fsync(daemon->flash_fd);
+        fsync(daemon->flash_fd);	// forces kernel to flush write buffers to device
         break;
     default:
-        break;
+        break;	// State IDLE/ERROR no need to clean up
     }
 
     /* Update state */
@@ -167,14 +169,25 @@ static void transition_state(struct doorbell_daemon *daemon,
         daemon->clip_number++;
 
         /* Start worker threads */
-        daemon->video_running = 1;
-        daemon->audio_running = 1;
-        pthread_create(&daemon->video_thread, NULL,
-                       video_capture_thread, daemon);
-        pthread_create(&daemon->audio_thread, NULL,
-                       audio_capture_thread, daemon);
+		/* Only start video thread if device exists */
+        if (daemon->video_fd >= 0) {
+            daemon->video_running = 1;
+            pthread_create(&daemon->video_thread, NULL,
+                           video_capture_thread, daemon);
+        } else {
+            syslog(LOG_WARNING, "No video device - skipping video capture");
+            daemon->video_running = 0;
+        }
 
-        syslog(LOG_INFO, "Recording clip #%d", daemon->clip_number);
+        /* Only start audio thread if device exists */
+        if (daemon->audio_capture_fd >= 0) {
+            daemon->audio_running = 1;
+            pthread_create(&daemon->audio_thread, NULL,
+                           audio_capture_thread, daemon);
+        } else {
+            syslog(LOG_WARNING, "No audio device - skipping audio capture");
+            daemon->audio_running = 0;
+        }
         break;
     case STATE_SAVING:
         syslog(LOG_INFO, "Saving %zu bytes to flash",
@@ -199,14 +212,16 @@ static void transition_state(struct doorbell_daemon *daemon,
 static void *video_capture_thread(void *arg)
 {
     struct doorbell_daemon *daemon = arg;
-    unsigned char frame[1024];
+    unsigned char frame[1024];		// 1KB temp buffer
     ssize_t bytes;
 
     syslog(LOG_INFO, "Video thread started");
 
     while (daemon->video_running) {
         /* Read frame from /dev/video0 (simulated) */
-        bytes = read(daemon->video_fd, frame, sizeof(frame));
+        bytes = read(daemon->video_fd, frame, sizeof(frame));	// Reads up to 1024 bytes from video device
+		// bytes: actual bytes read
+
         if (bytes > 0) {
             /* Copy to video buffer */
             if (daemon->bytes_captured + bytes < VIDEO_BUFFER_SIZE) {
@@ -274,7 +289,7 @@ static void handle_motion_event(struct doorbell_daemon *daemon)
     /* Read motion state */
     n = read(daemon->motion_fd, buf, sizeof(buf));
     if (n <= 0)
-        return;
+        return;		// 0: no data, shouldn't happen, epoll said data ready.
 
     syslog(LOG_INFO, "=== MOTION DETECTED ===");
 
@@ -287,32 +302,57 @@ static void handle_motion_event(struct doorbell_daemon *daemon)
 }
 
 /* Handle saving complete */
+// Saves clips to flash
 static void handle_save_complete(struct doorbell_daemon *daemon)
 {
-    char    filename[128];
-    ssize_t written;
+    char     filename[128];
+    ssize_t  written;
+    unsigned int erase_addr = 0;
 
-    /* Generate filename */
     snprintf(filename, sizeof(filename), "clip_%d_%ld.raw",
              daemon->clip_number, daemon->recording_start);
 
-    /* Write to flash */
-    written = write(daemon->flash_fd,
-                    daemon->video_buffer,
-                    daemon->bytes_captured);
-    if (written > 0) {
-        syslog(LOG_INFO, "Saved %zd bytes to flash: %s",
-               written, filename);
+    if (daemon->flash_fd >= 0) {
+        /* Erase sector before writing */
+        #define FLASH_IOCTL_MAGIC  'F'
+        #define FLASH_ERASE_SECTOR _IOW(FLASH_IOCTL_MAGIC, 1, unsigned int)
+
+		/* Erase sector 0 before writing */
+        ioctl(daemon->flash_fd, FLASH_ERASE_SECTOR, &erase_addr);
+
+		/* Seek back to beginning of flash */
+        lseek(daemon->flash_fd, 0, SEEK_SET);
+
+        /* Only write if we have data */
+        if (daemon->bytes_captured > 0) {
+            written = write(daemon->flash_fd,
+                            daemon->video_buffer,
+                            daemon->bytes_captured);
+            if (written > 0)
+                syslog(LOG_INFO, "Saved %zd bytes to flash: %s",
+                       written, filename);
+            else
+                syslog(LOG_ERR, "Failed to write to flash: %s",
+                       strerror(errno));
+        } else {
+            syslog(LOG_INFO, "No data to save (no video device)");
+        }
     } else {
-        syslog(LOG_ERR, "Failed to write to flash: %s",
-               strerror(errno));
+        syslog(LOG_WARNING, "No flash device available");
     }
 
     /* Return to idle */
     transition_state(daemon, STATE_IDLE);
 }
 ```
+`handle_motion_event()`:
+- `if (daemon->state == STATE_IDLE)`: Only trigger in IDLE state, cause recording takes time too. Without it, if motion triggers and the state is RECORDING, it starts recording **again**. Which means 2 video threads running simultaneously, can cause race condition.
 
+
+`handle_save_complete()`:
+- No encoding, save to raw bytes from `device_read()`. Real hardware system would use .mp4 or .h264.
+- `flash_fd`: `/dev/spiflash0` file descriptor
+ 
 ---
 
 ## Step 6: Main Event Loop with epoll
@@ -322,9 +362,9 @@ This is the heart of the daemon:
 /* Main event loop */
 static int daemon_event_loop(struct doorbell_daemon *daemon)
 {
-    struct epoll_event events[MAX_EVENTS];
-    struct epoll_event ev;
-    int nfds, i;
+    struct epoll_event events[MAX_EVENTS]; // Ready events
+    struct epoll_event ev;				   // Single event used when register a fd. Tells epoll to watch THIS fd for THESE events
+    int nfds, i;						   // nfds: how many events kernel found in this cycle
 
     /* Create epoll instance */
     daemon->epoll_fd = epoll_create1(0);
@@ -334,8 +374,8 @@ static int daemon_event_loop(struct doorbell_daemon *daemon)
     }
 
     /* Add motion sensor to epoll */
-    ev.events  = EPOLLIN;
-    ev.data.fd = daemon->motion_fd;
+    ev.events  = EPOLLIN;				// wakes when data is available to read
+    ev.data.fd = daemon->motion_fd;		// store fd to know who triggered later
     if (epoll_ctl(daemon->epoll_fd, EPOLL_CTL_ADD,
                   daemon->motion_fd, &ev) < 0) {
         syslog(LOG_ERR, "epoll_ctl (motion) failed: %s",
@@ -368,12 +408,22 @@ static int daemon_event_loop(struct doorbell_daemon *daemon)
         /* State machine timeout handling */
         if (daemon->state == STATE_SAVING)
             handle_save_complete(daemon);
+
+		/* If recording but no video/audio, go straight to saving */
+        if (daemon->state == STATE_RECORDING &&
+            !daemon->video_running &&
+            !daemon->audio_running) {
+            syslog(LOG_INFO, "No capture devices - skipping to save");
+            transition_state(daemon, STATE_SAVING);
+        }
     }
 
     close(daemon->epoll_fd);
     return 0;
 }
 ```
+- `daemon->epoll_fd`: works like a watchlist manager. `epoll_ctl()` control to list, `epoll_wait()` to see what's ready.
+- `if (fd == daemon->motion_fd)`: our event is motion triggered by now, so the fd only allows from `motion_fd`
 
 ---
 
@@ -413,10 +463,10 @@ static int daemon_init(struct doorbell_daemon *daemon)
         /* Continue anyway for simulation */
     }
 
-    daemon->video_fd = open("/dev/video0",    O_RDWR | O_NONBLOCK);
+    daemon->video_fd = open("/dev/video10",    O_RDWR | O_NONBLOCK);
     daemon->flash_fd = open("/dev/spiflash0", O_RDWR);
 
-    /* Audio disabled in QEMU - see Week 3 Day 1-2 Step 7 */
+    /* Audio disabled in QEMU - see Stage 3-1 Step 7 */
     daemon->audio_capture_fd  = -1;
     daemon->audio_playback_fd = -1;
     /* TODO: On real Pi, open ALSA PCM devices:
@@ -453,8 +503,8 @@ static void daemon_cleanup(struct doorbell_daemon *daemon)
     free(daemon->video_buffer);
     free(daemon->audio_buffer);
 
-    closelog();
-    syslog(LOG_INFO, "Daemon cleanup complete");
+    closelog();		// Closes the connection to syslog daemon
+    syslog(LOG_INFO, "Daemon cleanup complete");	// Reopens automatically
 }
 
 /* Main entry point */
@@ -488,10 +538,12 @@ int main(int argc, char *argv[])
     return ret;
 }
 ```
+`signal_handler()`:
+- Handle shutdown signals (`Ctrl+C`: signal 2, `kill`: signal 15, `segfault`: signal 11...).
 
 ---
 
-## Step 8: Compile and Test
+## Step 8: Compile
 
 ### Makefile
 ```makefile
@@ -521,14 +573,198 @@ clean:
 make
 ```
 
+---
+
+## Step 9: Modify motion_char.c for polling
+### Add `poll()` to motion_char Driver
+Copy paste this to the previous ` ~/kernel-modules/motion_char/motion_char.c
+`:
+```c
+#include <linux/poll.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/uaccess.h>
+
+#define DEVICE_NAME "motion"
+#define CLASS_NAME  "motion_class"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Danny");
+MODULE_DESCRIPTION("Motion sensor character device");
+
+static int            major_number;
+static struct class  *motion_class  = NULL;
+static struct device *motion_device = NULL;
+
+static int motion_state         = 0;  /* current state */
+static int motion_data_available = 0; /* new unread event */
+
+static DECLARE_WAIT_QUEUE_HEAD(motion_wait_queue);
+
+static int device_open(struct inode *inode, struct file *file)
+{
+    printk(KERN_INFO "Motion device opened\n");
+    return 0;
+}
+
+static ssize_t device_read(struct file *file, char __user *buffer,
+                            size_t len, loff_t *offset)
+{
+    char msg[32];
+    int  msg_len;
+
+    msg_len = snprintf(msg, sizeof(msg), "motion=%d\n", motion_state);
+
+    if (*offset >= msg_len){
+		*offset = 0;	// Reset to read more than 1 motion triggeer
+        return 0;
+	}
+
+    if (copy_to_user(buffer, msg, msg_len))
+        return -EFAULT;
+
+    *offset += msg_len;
+
+    /* Clear after reading — ready for next event */
+    motion_data_available = 0;
+
+    return msg_len;
+}
+
+static ssize_t device_write(struct file *file, const char __user *buffer,
+                              size_t len, loff_t *offset)
+{
+    char user_msg[32];
+
+    if (len >= sizeof(user_msg))
+        len = sizeof(user_msg) - 1;
+
+    if (copy_from_user(user_msg, buffer, len))
+        return -EFAULT;
+
+    user_msg[len] = '\0';
+
+    if (user_msg[0] == '1')
+        motion_state = 1;
+    else if (user_msg[0] == '0')
+        motion_state = 0;
+
+    /* Mark new data available and wake epoll */
+    motion_data_available = 1;
+    wake_up(&motion_wait_queue);  /* ← wakes epoll/select/poll */
+
+    printk(KERN_INFO "Motion state set to %d\n", motion_state);
+    return len;
+}
+
+static int device_release(struct inode *inode, struct file *file)
+{
+    printk(KERN_INFO "Motion device closed\n");
+    return 0;
+}
+
+static unsigned int motion_poll(struct file *file, poll_table *wait)
+{
+    poll_wait(file, &motion_wait_queue, wait);
+
+    /* Only return POLLIN when new unread data exists */
+    if (motion_data_available)
+        return POLLIN | POLLRDNORM;
+
+    return 0;  /* nothing to read — epoll sleeps */
+}
+
+static struct file_operations fops = {
+    .owner   = THIS_MODULE,
+    .open    = device_open,
+    .read    = device_read,
+    .write   = device_write,
+    .release = device_release,
+    .poll    = motion_poll,
+};
+
+static int __init motion_char_init(void)
+{
+    printk(KERN_INFO "Motion: Initializing device\n");
+
+    major_number = register_chrdev(0, DEVICE_NAME, &fops);
+    if (major_number < 0) {
+        printk(KERN_ALERT "Motion: Failed to register\n");
+        return major_number;
+    }
+
+    motion_class = class_create(THIS_MODULE, CLASS_NAME);
+    if (IS_ERR(motion_class)) {
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return PTR_ERR(motion_class);
+    }
+
+    motion_device = device_create(motion_class, NULL,
+                                  MKDEV(major_number, 0),
+                                  NULL, DEVICE_NAME "0");
+    if (IS_ERR(motion_device)) {
+        class_destroy(motion_class);
+        unregister_chrdev(major_number, DEVICE_NAME);
+        return PTR_ERR(motion_device);
+    }
+
+    printk(KERN_INFO "Motion: Device created successfully\n");
+    return 0;
+}
+
+static void __exit motion_char_exit(void)
+{
+    device_destroy(motion_class, MKDEV(major_number, 0));
+    class_destroy(motion_class);
+    unregister_chrdev(major_number, DEVICE_NAME);
+    printk(KERN_INFO "Motion: Device unregistered\n");
+}
+
+module_init(motion_char_init);
+module_exit(motion_char_exit);
+```
+
+1. 
+
+### Recompile
+```
+cd ~/kernel-modules/motion_char
+make clean && make
+sudo rmmod motion_char
+sudo insmod ~/kernel-modules/motion_char/motion_char.ko
+sudo insmod ~/kernel-modules/spiflash/spiflash.ko
+sudo chmod 666 /dev/motion0 /dev/spiflash0
+```
+
+---
+
+## Step 10: Test
+
 ### Test the Daemon
 ```
-# Terminal 1: Run daemon
-./doorbellod
+# Verify all devices exist
+ls -l /dev/motion0 /dev/spiflash0
+
+# Terminal 1: Run daemon in background and watch logs
+./doorbellod &
+tail -f /var/log/syslog | grep doorbellod
 
 # Terminal 2: Simulate motion
 ~/simulate_motion.sh
+```
+Expected:
+```
+=== MOTION DETECTED ===     ← trigger 1
+State transition: 0 -> 1
+State transition: 1 -> 2
+State transition: 2 -> 0
+Ready - waiting for motion
 
-# Watch logs
-tail -f /var/log/syslog | grep doorbellod
+=== MOTION DETECTED ===     ← trigger 2
+...
+=== MOTION DETECTED ===     ← trigger 3
+...
 ```
