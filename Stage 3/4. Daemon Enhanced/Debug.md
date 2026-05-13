@@ -559,7 +559,17 @@ May  7 08:53:32 raspberrypi doorbellod[19970]: SPI sender thread stopped - sent 
 ---
 
 ### Numerical Verification
+| Metric | Cycle 1 (2s) | Cycle 2 (3s) | Status |
+|--------|--------------|--------------|--------|
+| **Video Time** | 61÷30 = 2.03s | 91÷30 = 3.03s | ✅ |
+| **Audio Time** | 94×0.021 = 2.00s | 141×0.021 = 3.00s | ✅ |
+| **Sync Error** | 0.03s (30ms) | 0.03s (30ms) | ✅ |
+| **Video Wraps** | 61÷5 = 12 | 91÷5 = 18 | ✅ |
+| **Audio Wraps** | 94÷10 = 9 | 141÷10 = 14 | ✅ |
+| **SPI Video Eff** | 60/61 = 98.4% | 90/91 = 98.9% | ✅ |
+| **SPI Audio Eff** | 92/94 = 97.9% | 139/141 = 98.6% | ✅ |
 
+All metrics within acceptable tolerance. ✅
 ---
 
 ### Conclusion
@@ -599,6 +609,9 @@ gcc -g -o doorbellod doorbellod.c -lpthread -lasound
 
 # Run under GDB
 gdb ./doorbellod
+
+# New virtual video (In terminal 2)
+ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 -f v4l2 /dev/video10
 ```
 
 
